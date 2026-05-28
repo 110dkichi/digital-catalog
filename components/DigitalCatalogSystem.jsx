@@ -28,7 +28,7 @@ import {
 } from "lucide-react";
 
 // ─── 定数 ───────────────────────────────────────────────────────────────────
-const ADMIN_PASSWORD = "admin123";
+const ADMIN_PASSWORD = "automize7765";
 const STORAGE_ACCESS  = "dcs_access_log";   // アクセスカウント用
 const STORAGE_VISITORS = "dcs_visitor_log"; // 来場者企業名ログ用
 
