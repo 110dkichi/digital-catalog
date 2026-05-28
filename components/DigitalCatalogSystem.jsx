@@ -1,48 +1,77 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import {
   Download, FileText, CheckSquare, Square, Plus, Trash2,
   Settings, Save, QrCode, Building2, Calendar, X, Package,
   Lock, LogOut, ShieldCheck, Eye, EyeOff, Users, RotateCcw,
   AlertTriangle, ChevronDown, ChevronUp, FileDown, Building,
-  Link as LinkIcon, ExternalLink,
+  Link as LinkIcon, ExternalLink, Loader, RefreshCw,
 } from "lucide-react";
 
 // ─── 定数 ─────────────────────────────────────────────────────────────────────
 const ADMIN_PASSWORD   = "admin123";
 const STORAGE_ACCESS   = "dcs_access_log";
 const STORAGE_VISITORS = "dcs_visitor_log";
-
-const INITIAL_CATALOGS = [
-  { id: 1, title: "製品総合カタログ 2025年版",   fileSize: "8.2 MB",  description: "全製品ラインナップを網羅した総合カタログです。最新モデルの仕様・価格表を含みます。",  downloadUrl: "" },
-  { id: 2, title: "産業用ソリューション ガイド",  fileSize: "4.5 MB",  description: "製造・物流現場向けの導入事例と活用シナリオを詳しくご紹介します。",               downloadUrl: "" },
-  { id: 3, title: "サービス・保守パッケージ一覧", fileSize: "2.1 MB",  description: "アフターサポートプランの詳細と、各プランの比較表を掲載しています。",               downloadUrl: "" },
-  { id: 4, title: "技術仕様書（エンジニア向け）", fileSize: "12.0 MB", description: "API仕様・電気回路図・取付寸法図を含む詳細な技術資料です。",                         downloadUrl: "" },
-];
-
-const INITIAL_EVENT_INFO = {
-  companyName: "株式会社テクノソリューションズ",
-  eventName:   "第30回 産業技術展 2025",
-};
+const SUPABASE_URL     = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_KEY     = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
 const F = "'Meiryo','Hiragino Kaku Gothic ProN','Noto Sans JP','Yu Gothic',sans-serif";
 
-// ─── Google Drive URL変換 ────────────────────────────────────────────────────
-// 共有URL → ダウンロードURL に自動変換する
+// ─── Supabase API ─────────────────────────────────────────────────────────────
+const sb = {
+  headers: {
+    "Content-Type": "application/json",
+    "apikey": SUPABASE_KEY,
+    "Authorization": `Bearer ${SUPABASE_KEY}`,
+  },
+
+  async getEventInfo() {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/event_info?id=eq.1`, { headers: this.headers });
+    const data = await res.json();
+    return data[0] || { company_name: "オートマイズ・ラボ", event_name: "展示会名" };
+  },
+
+  async saveEventInfo(companyName, eventName) {
+    await fetch(`${SUPABASE_URL}/rest/v1/event_info?id=eq.1`, {
+      method: "PATCH",
+      headers: { ...this.headers, "Prefer": "return=minimal" },
+      body: JSON.stringify({ company_name: companyName, event_name: eventName }),
+    });
+  },
+
+  async getCatalogs() {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/catalogs?order=sort_order.asc,created_at.asc`, { headers: this.headers });
+    return await res.json();
+  },
+
+  async addCatalog(title, fileSize, description, downloadUrl) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/catalogs`, {
+      method: "POST",
+      headers: { ...this.headers, "Prefer": "return=representation" },
+      body: JSON.stringify({ title, file_size: fileSize, description, download_url: downloadUrl }),
+    });
+    const data = await res.json();
+    return data[0];
+  },
+
+  async deleteCatalog(id) {
+    await fetch(`${SUPABASE_URL}/rest/v1/catalogs?id=eq.${id}`, {
+      method: "DELETE",
+      headers: this.headers,
+    });
+  },
+};
+
+// ─── Google Drive URL変換 ─────────────────────────────────────────────────────
 function convertDriveUrl(url) {
   if (!url) return "";
-  // https://drive.google.com/file/d/FILEID/view... 形式
   const match = url.match(/\/file\/d\/([^/]+)/);
   if (match) return `https://drive.google.com/uc?export=download&id=${match[1]}`;
-  // すでにuc?export=download形式ならそのまま
   if (url.includes("drive.google.com/uc")) return url;
   return url;
 }
+function isDriveUrl(url) { return url && url.includes("drive.google.com"); }
 
-function isDriveUrl(url) {
-  return url && url.includes("drive.google.com");
-}
-
-// ─── localStorage ─────────────────────────────────────────────────────────────
+// ─── localStorage（アクセスログ・来場者ログ） ─────────────────────────────────
 function lsGet(k, fb) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch { return fb; } }
 function lsSet(k, v)  { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 
@@ -88,21 +117,24 @@ export default function DigitalCatalogSystem() {
   const [authShake,     setAuthShake]     = useState(false);
   const passwordRef = useRef(null);
 
-  // 共有データ
-  const [catalogs,      setCatalogs]      = useState(INITIAL_CATALOGS);
-  const [eventInfo,     setEventInfo]     = useState(INITIAL_EVENT_INFO);
-  const [tempEventInfo, setTempEventInfo] = useState(INITIAL_EVENT_INFO);
+  // Supabaseデータ
+  const [catalogs,   setCatalogs]   = useState([]);
+  const [eventInfo,  setEventInfo]  = useState({ company_name: "", event_name: "" });
+  const [loading,    setLoading]    = useState(true);
+
+  // 管理者編集用
+  const [tempCompany,  setTempCompany]  = useState("");
+  const [tempEvent,    setTempEvent]    = useState("");
+  const [infoSaved,    setInfoSaved]    = useState(false);
+  const [showAddForm,  setShowAddForm]  = useState(false);
+  const [newCatalog,   setNewCatalog]   = useState({ title:"", fileSize:"", description:"", driveUrl:"" });
+  const [formError,    setFormError]    = useState("");
+  const [urlValid,     setUrlValid]     = useState(null);
+  const [saving,       setSaving]       = useState(false);
 
   // 来場者
   const [selectedIds,    setSelectedIds]   = useState([]);
   const [visitorCompany, setVisitorCompany] = useState("");
-
-  // 管理者
-  const [infoSaved,   setInfoSaved]   = useState(false);
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [newCatalog,  setNewCatalog]  = useState({ title:"", fileSize:"", description:"", driveUrl:"" });
-  const [formError,   setFormError]   = useState("");
-  const [urlValid,    setUrlValid]    = useState(null); // null=未チェック, true=OK, false=NG
 
   // ログ
   const [accessLog,        setAccessLog]       = useState(() => loadAccessLog());
@@ -111,12 +143,27 @@ export default function DigitalCatalogSystem() {
   const [showResetAccess,  setShowResetAccess]  = useState(false);
   const [showResetVisitor, setShowResetVisitor] = useState(false);
 
-  useEffect(() => { setAccessLog(prev => recordAccess(prev)); }, []);
+  // ── Supabaseからデータ取得 ──
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [info, cats] = await Promise.all([sb.getEventInfo(), sb.getCatalogs()]);
+      setEventInfo(info);
+      setTempCompany(info.company_name);
+      setTempEvent(info.event_name);
+      setCatalogs(cats);
+    } catch(e) {
+      console.error(e);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
-    if (mode !== "admin") return;
-    const id = setInterval(() => { setAccessLog(loadAccessLog()); setVisitorLog(loadVisitorLog()); }, 60000);
-    return () => clearInterval(id);
-  }, [mode]);
+    fetchData();
+    setAccessLog(prev => recordAccess(prev));
+  }, [fetchData]);
+
   useEffect(() => { if (showAuthModal) setTimeout(() => passwordRef.current?.focus(), 50); }, [showAuthModal]);
 
   // ── 認証 ──
@@ -124,7 +171,6 @@ export default function DigitalCatalogSystem() {
   const handleAuth = () => {
     if (passwordInput === ADMIN_PASSWORD) {
       setShowAuthModal(false); setPasswordInput(""); setAuthError("");
-      setTempEventInfo({ ...eventInfo }); setAccessLog(loadAccessLog()); setVisitorLog(loadVisitorLog());
       setMode("admin");
     } else {
       setAuthError("パスワードが正しくありません。");
@@ -149,11 +195,8 @@ export default function DigitalCatalogSystem() {
   const handleDownload = (titleList, catalog) => {
     const updated = addVisitorEntry(visitorLog, visitorCompany, titleList);
     setVisitorLog(updated);
-    if (catalog?.downloadUrl) {
-      window.open(catalog.downloadUrl, "_blank");
-    } else {
-      alert(`✅ ダウンロード開始\n\n${titleList.join("\n")}`);
-    }
+    if (catalog?.download_url) window.open(catalog.download_url, "_blank");
+    else alert(`✅ ダウンロード開始\n\n${titleList.join("\n")}`);
   };
 
   const handleBulkDownload = () => {
@@ -161,36 +204,54 @@ export default function DigitalCatalogSystem() {
     const titles = sel.map(c => `・${c.title}`);
     const updated = addVisitorEntry(visitorLog, visitorCompany, titles);
     setVisitorLog(updated);
-    sel.forEach(c => { if (c.downloadUrl) window.open(c.downloadUrl, "_blank"); });
-    if (!sel.some(c => c.downloadUrl)) alert(`✅ ダウンロード開始\n\n${titles.join("\n")}`);
+    sel.forEach(c => { if (c.download_url) window.open(c.download_url, "_blank"); });
+    if (!sel.some(c => c.download_url)) alert(`✅ ダウンロード開始\n\n${titles.join("\n")}`);
   };
 
-  // ── DriveURL のバリデーション ──
+  // ── 管理者：基本情報保存 ──
+  const handleSaveEventInfo = async () => {
+    setSaving(true);
+    try {
+      await sb.saveEventInfo(tempCompany, tempEvent);
+      setEventInfo({ company_name: tempCompany, event_name: tempEvent });
+      setInfoSaved(true); setTimeout(() => setInfoSaved(false), 2500);
+    } catch(e) { alert("保存に失敗しました。"); }
+    finally { setSaving(false); }
+  };
+
+  // ── 管理者：カタログ追加 ──
   const handleDriveUrlChange = (val) => {
     setNewCatalog(p => ({ ...p, driveUrl: val }));
     if (!val) { setUrlValid(null); return; }
-    const isValid = val.includes("drive.google.com");
-    setUrlValid(isValid);
+    setUrlValid(val.includes("drive.google.com"));
   };
 
-  // ── カタログ追加 ──
-  const handleAddCatalog = () => {
+  const handleAddCatalog = async () => {
     if (!newCatalog.title.trim()) { setFormError("タイトルは必須です。"); return; }
     if (!newCatalog.driveUrl.trim()) { setFormError("Google DriveのURLを入力してください。"); return; }
     if (!isDriveUrl(newCatalog.driveUrl)) { setFormError("Google DriveのURLを入力してください。"); return; }
-    const downloadUrl = convertDriveUrl(newCatalog.driveUrl);
-    setCatalogs(prev => [...prev, {
-      id: Date.now(), title: newCatalog.title,
-      fileSize: newCatalog.fileSize || "—",
-      description: newCatalog.description,
-      downloadUrl,
-    }]);
-    setNewCatalog({ title:"", fileSize:"", description:"", driveUrl:"" });
-    setFormError(""); setShowAddForm(false); setUrlValid(null);
+    setSaving(true);
+    try {
+      const downloadUrl = convertDriveUrl(newCatalog.driveUrl);
+      const added = await sb.addCatalog(newCatalog.title, newCatalog.fileSize||"—", newCatalog.description, downloadUrl);
+      setCatalogs(prev => [...prev, added]);
+      setNewCatalog({ title:"", fileSize:"", description:"", driveUrl:"" });
+      setFormError(""); setShowAddForm(false); setUrlValid(null);
+    } catch(e) { setFormError("追加に失敗しました。"); }
+    finally { setSaving(false); }
   };
 
-  const handleDelete = (id) => { setCatalogs(prev => prev.filter(c => c.id !== id)); setSelectedIds(prev => prev.filter(x => x !== id)); };
-  const handleSaveEventInfo = () => { setEventInfo({ ...tempEventInfo }); setInfoSaved(true); setTimeout(() => setInfoSaved(false), 2500); };
+  // ── 管理者：カタログ削除 ──
+  const handleDelete = async (id, title) => {
+    if (!window.confirm(`「${title}」を削除しますか？`)) return;
+    try {
+      await sb.deleteCatalog(id);
+      setCatalogs(prev => prev.filter(c => c.id !== id));
+      setSelectedIds(prev => prev.filter(x => x !== id));
+    } catch(e) { alert("削除に失敗しました。"); }
+  };
+
+  // ── リセット ──
   const handleResetAccess   = () => { setAccessLog(resetAccessLog());   setShowResetAccess(false); };
   const handleResetVisitor  = () => { setVisitorLog(resetVisitorLog()); setShowResetVisitor(false); };
 
@@ -199,14 +260,22 @@ export default function DigitalCatalogSystem() {
   const btnOutline = (x={}) => ({ display:"flex", alignItems:"center", gap:"6px", padding:"7px 13px", border:"1.5px solid #0ea5e9", borderRadius:"8px", background:"#fff", color:"#0ea5e9", fontSize:"13px", fontWeight:"600", cursor:"pointer", fontFamily:F, ...x });
   const btnDanger  = (x={}) => ({ display:"flex", alignItems:"center", gap:"5px", padding:"6px 12px", border:"1px solid #fca5a5", borderRadius:"7px", background:"transparent", color:"#ef4444", fontSize:"12px", fontWeight:"600", cursor:"pointer", fontFamily:F, ...x });
 
+  if (loading) return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", flexDirection:"column", gap:"16px", fontFamily:F }}>
+      <Loader size={32} color="#0ea5e9" style={{ animation:"spin 1s linear infinite" }}/>
+      <p style={{ color:"var(--color-text-secondary)", fontSize:"14px" }}>読み込み中...</p>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+
   return (
     <div style={{ fontFamily:F, minHeight:"100vh", background:"var(--color-background-tertiary)", color:"var(--color-text-primary)" }}>
       <style>{`
         @keyframes shake   { 0%,100%{transform:translateX(0)} 20%{transform:translateX(-8px)} 40%{transform:translateX(8px)} 60%{transform:translateX(-5px)} 80%{transform:translateX(5px)} }
         @keyframes modalIn { from{opacity:0;transform:translateY(-12px) scale(.97)} to{opacity:1;transform:translateY(0) scale(1)} }
-        @keyframes countUp { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
-        .modal-anim { animation: modalIn .2s ease; }
-        .shake-anim { animation: shake .4s ease; }
+        @keyframes spin    { to{transform:rotate(360deg)} }
+        .modal-anim  { animation: modalIn .2s ease; }
+        .shake-anim  { animation: shake .4s ease; }
         .hover-danger:hover { background:#fef2f2 !important; }
         .hover-row:hover    { background: var(--color-background-secondary) !important; }
       `}</style>
@@ -249,11 +318,11 @@ export default function DigitalCatalogSystem() {
           <header style={{ background:"linear-gradient(135deg,#0ea5e9 0%,#06b6d4 100%)", padding:"2rem 1.5rem 1.5rem", color:"#fff" }}>
             <div style={{ maxWidth:"720px", margin:"0 auto" }}>
               <div style={{ display:"flex", alignItems:"center", gap:"10px", marginBottom:"6px", opacity:.85, fontSize:"14px" }}>
-                <Calendar size={15}/>{eventInfo.eventName}
+                <Calendar size={15}/>{eventInfo.event_name}
               </div>
               <div style={{ display:"flex", alignItems:"center", gap:"10px" }}>
                 <Building2 size={26}/>
-                <h1 style={{ margin:0, fontSize:"22px", fontWeight:"700", letterSpacing:".03em" }}>{eventInfo.companyName}</h1>
+                <h1 style={{ margin:0, fontSize:"22px", fontWeight:"700", letterSpacing:".03em" }}>{eventInfo.company_name}</h1>
               </div>
               <p style={{ margin:"10px 0 0", fontSize:"14px", opacity:.9 }}>ご来場ありがとうございます。ご希望のカタログをお選びください。</p>
             </div>
@@ -288,31 +357,37 @@ export default function DigitalCatalogSystem() {
             </div>
 
             {/* カタログ一覧 */}
-            <div style={{ display:"flex", flexDirection:"column", gap:"12px" }}>
-              {catalogs.map(catalog => {
-                const isSel = selectedIds.includes(catalog.id);
-                return (
-                  <div key={catalog.id} onClick={() => toggleSelect(catalog.id)}
-                    style={{ background:"var(--color-background-primary)", border: isSel ? "2px solid #0ea5e9" : "1.5px solid var(--color-border-tertiary)", borderRadius:"12px", padding:"1rem 1.25rem", cursor:"pointer", display:"flex", gap:"14px", alignItems:"flex-start", boxShadow: isSel ? "0 2px 12px rgba(14,165,233,.18)" : "none" }}>
-                    <div style={{ paddingTop:"2px", flexShrink:0 }}>
-                      {isSel ? <CheckSquare size={22} color="#0ea5e9"/> : <Square size={22} color="var(--color-text-secondary)"/>}
+            {catalogs.length === 0 ? (
+              <div style={{ textAlign:"center", padding:"3rem", color:"var(--color-text-secondary)", fontSize:"14px" }}>
+                カタログはまだ登録されていません。
+              </div>
+            ) : (
+              <div style={{ display:"flex", flexDirection:"column", gap:"12px" }}>
+                {catalogs.map(catalog => {
+                  const isSel = selectedIds.includes(catalog.id);
+                  return (
+                    <div key={catalog.id} onClick={() => toggleSelect(catalog.id)}
+                      style={{ background:"var(--color-background-primary)", border: isSel ? "2px solid #0ea5e9" : "1.5px solid var(--color-border-tertiary)", borderRadius:"12px", padding:"1rem 1.25rem", cursor:"pointer", display:"flex", gap:"14px", alignItems:"flex-start", boxShadow: isSel ? "0 2px 12px rgba(14,165,233,.18)" : "none" }}>
+                      <div style={{ paddingTop:"2px", flexShrink:0 }}>
+                        {isSel ? <CheckSquare size={22} color="#0ea5e9"/> : <Square size={22} color="var(--color-text-secondary)"/>}
+                      </div>
+                      <div style={{ width:"44px", height:"44px", borderRadius:"10px", background: isSel ? "#e0f2fe" : "var(--color-background-secondary)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
+                        <FileText size={22} color={isSel ? "#0ea5e9" : "var(--color-text-secondary)"}/>
+                      </div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <p style={{ margin:"0 0 4px", fontWeight:"700", fontSize:"15px", color: isSel ? "#0369a1" : "var(--color-text-primary)" }}>{catalog.title}</p>
+                        <p style={{ margin:"0 0 6px", fontSize:"13px", color:"var(--color-text-secondary)", lineHeight:1.6 }}>{catalog.description}</p>
+                        <span style={{ fontSize:"12px", color:"#0ea5e9", fontWeight:"600", background:"#e0f2fe", padding:"2px 8px", borderRadius:"20px" }}>PDF · {catalog.file_size}</span>
+                      </div>
+                      <button onClick={e => { e.stopPropagation(); handleDownload([`・${catalog.title}`], catalog); }}
+                        style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"5px", padding:"7px 12px", border:"1.5px solid #0ea5e9", borderRadius:"8px", background: isSel ? "#0ea5e9" : "#fff", color: isSel ? "#fff" : "#0ea5e9", fontSize:"12px", fontWeight:"600", cursor:"pointer", fontFamily:F, whiteSpace:"nowrap" }}>
+                        <Download size={13}/>DL
+                      </button>
                     </div>
-                    <div style={{ width:"44px", height:"44px", borderRadius:"10px", background: isSel ? "#e0f2fe" : "var(--color-background-secondary)", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>
-                      <FileText size={22} color={isSel ? "#0ea5e9" : "var(--color-text-secondary)"}/>
-                    </div>
-                    <div style={{ flex:1, minWidth:0 }}>
-                      <p style={{ margin:"0 0 4px", fontWeight:"700", fontSize:"15px", color: isSel ? "#0369a1" : "var(--color-text-primary)" }}>{catalog.title}</p>
-                      <p style={{ margin:"0 0 6px", fontSize:"13px", color:"var(--color-text-secondary)", lineHeight:1.6 }}>{catalog.description}</p>
-                      <span style={{ fontSize:"12px", color:"#0ea5e9", fontWeight:"600", background:"#e0f2fe", padding:"2px 8px", borderRadius:"20px" }}>PDF · {catalog.fileSize}</span>
-                    </div>
-                    <button onClick={e => { e.stopPropagation(); handleDownload([`・${catalog.title}`], catalog); }}
-                      style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"5px", padding:"7px 12px", border:"1.5px solid #0ea5e9", borderRadius:"8px", background: isSel ? "#0ea5e9" : "#fff", color: isSel ? "#fff" : "#0ea5e9", fontSize:"12px", fontWeight:"600", cursor:"pointer", fontFamily:F, whiteSpace:"nowrap" }}>
-                      <Download size={13}/>DL
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+              </div>
+            )}
 
             <div style={{ marginTop:"2rem", padding:"1rem", background:"var(--color-background-primary)", border:"0.5px solid var(--color-border-tertiary)", borderRadius:"12px", display:"flex", alignItems:"center", gap:"12px", fontSize:"13px", color:"var(--color-text-secondary)" }}>
               <QrCode size={28} color="#0ea5e9"/>
@@ -321,7 +396,7 @@ export default function DigitalCatalogSystem() {
           </main>
 
           <footer style={{ marginTop:"3rem", padding:"1.5rem 1.5rem 2rem", textAlign:"center", borderTop:"0.5px solid var(--color-border-tertiary)" }}>
-            <p style={{ fontSize:"12px", color:"var(--color-text-secondary)", margin:"0 0 12px", opacity:.6 }}>© 2025 {eventInfo.companyName}. All rights reserved.</p>
+            <p style={{ fontSize:"12px", color:"var(--color-text-secondary)", margin:"0 0 12px", opacity:.6 }}>© 2025 {eventInfo.company_name}. All rights reserved.</p>
             <button onClick={openAuthModal} style={{ background:"none", border:"none", cursor:"pointer", padding:"6px", opacity:.15, color:"var(--color-text-secondary)", display:"inline-flex", borderRadius:"6px", transition:"opacity .2s" }}
               onMouseEnter={e => e.currentTarget.style.opacity="0.45"} onMouseLeave={e => e.currentTarget.style.opacity="0.15"}>
               <Lock size={14}/>
@@ -343,12 +418,18 @@ export default function DigitalCatalogSystem() {
                 <p style={{ margin:0, color:"#64748b", fontSize:"12px" }}>展示会情報・カタログの設定・管理</p>
               </div>
             </div>
-            <button onClick={handleLogout}
-              style={{ display:"flex", alignItems:"center", gap:"6px", padding:"8px 14px", border:"1px solid #334155", borderRadius:"8px", background:"transparent", color:"#94a3b8", fontSize:"13px", fontWeight:"600", cursor:"pointer", fontFamily:F }}
-              onMouseEnter={e => { e.currentTarget.style.borderColor="#ef4444"; e.currentTarget.style.color="#f87171"; }}
-              onMouseLeave={e => { e.currentTarget.style.borderColor="#334155"; e.currentTarget.style.color="#94a3b8"; }}>
-              <LogOut size={14}/>ログアウト
-            </button>
+            <div style={{ display:"flex", gap:"8px" }}>
+              <button onClick={fetchData}
+                style={{ display:"flex", alignItems:"center", gap:"6px", padding:"8px 14px", border:"1px solid #334155", borderRadius:"8px", background:"transparent", color:"#94a3b8", fontSize:"13px", fontWeight:"600", cursor:"pointer", fontFamily:F }}>
+                <RefreshCw size={14}/>更新
+              </button>
+              <button onClick={handleLogout}
+                style={{ display:"flex", alignItems:"center", gap:"6px", padding:"8px 14px", border:"1px solid #334155", borderRadius:"8px", background:"transparent", color:"#94a3b8", fontSize:"13px", fontWeight:"600", cursor:"pointer", fontFamily:F }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor="#ef4444"; e.currentTarget.style.color="#f87171"; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor="#334155"; e.currentTarget.style.color="#94a3b8"; }}>
+                <LogOut size={14}/>ログアウト
+              </button>
+            </div>
           </header>
 
           <main style={{ maxWidth:"860px", margin:"0 auto", padding:"1.5rem" }}>
@@ -369,7 +450,7 @@ export default function DigitalCatalogSystem() {
               <SectionTitle icon={<Building size={18} color="#0ea5e9"/>} label="来場者リスト">
                 <div style={{ display:"flex", gap:"8px", alignItems:"center" }}>
                   <span style={{ background:"#e0f2fe", color:"#0369a1", fontSize:"12px", fontWeight:"700", padding:"2px 10px", borderRadius:"20px" }}>{visitorLog.entries.length}件</span>
-                  <button onClick={() => exportCSV(visitorLog.entries, eventInfo.eventName)} style={btnPrimary({ fontSize:"12px", padding:"6px 12px" })}><FileDown size={13}/>CSV出力</button>
+                  <button onClick={() => exportCSV(visitorLog.entries, eventInfo.event_name)} style={btnPrimary({ fontSize:"12px", padding:"6px 12px" })}><FileDown size={13}/>CSV出力</button>
                   <button onClick={() => setShowResetVisitor(true)} style={btnDanger()} className="hover-danger"><RotateCcw size={12}/>リセット</button>
                   <button onClick={() => setShowVisitorList(v => !v)}
                     style={{ display:"flex", alignItems:"center", gap:"5px", padding:"6px 12px", border:"1px solid var(--color-border-tertiary)", borderRadius:"7px", background:"transparent", color:"var(--color-text-secondary)", fontSize:"12px", fontWeight:"600", cursor:"pointer", fontFamily:F }}>
@@ -380,7 +461,7 @@ export default function DigitalCatalogSystem() {
               {showVisitorList && (
                 <div style={{ background:"var(--color-background-primary)", border:"0.5px solid var(--color-border-tertiary)", borderRadius:"12px", overflow:"hidden" }}>
                   {visitorLog.entries.length === 0 ? (
-                    <div style={{ padding:"2.5rem", textAlign:"center", color:"var(--color-text-secondary)", fontSize:"14px" }}>まだ記録がありません。来場者がダウンロードを行うと、ここに表示されます。</div>
+                    <div style={{ padding:"2.5rem", textAlign:"center", color:"var(--color-text-secondary)", fontSize:"14px" }}>まだ記録がありません。</div>
                   ) : (
                     <>
                       <div style={{ display:"grid", gridTemplateColumns:"36px 1fr 1fr 2fr", padding:"8px 16px", background:"var(--color-background-secondary)", borderBottom:"0.5px solid var(--color-border-tertiary)", fontSize:"11px", fontWeight:"700", color:"var(--color-text-secondary)", letterSpacing:".05em" }}>
@@ -414,11 +495,16 @@ export default function DigitalCatalogSystem() {
             <section style={{ marginBottom:"2rem" }}>
               <SectionTitle icon={<Building2 size={18} color="#0ea5e9"/>} label="基本情報設定"/>
               <div style={{ background:"var(--color-background-primary)", border:"0.5px solid var(--color-border-tertiary)", borderRadius:"12px", padding:"1.5rem" }}>
-                <Field label="会社名"><input type="text" value={tempEventInfo.companyName} onChange={e => setTempEventInfo(p => ({ ...p, companyName: e.target.value }))} style={inputStyle()}/></Field>
-                <Field label="展示会名"><input type="text" value={tempEventInfo.eventName} onChange={e => setTempEventInfo(p => ({ ...p, eventName: e.target.value }))} style={inputStyle({ marginBottom:"1.25rem" })}/></Field>
-                <button onClick={handleSaveEventInfo}
-                  style={{ display:"flex", alignItems:"center", gap:"7px", padding:"10px 20px", border:"none", borderRadius:"8px", background: infoSaved ? "#10b981" : "#0ea5e9", color:"#fff", fontSize:"14px", fontWeight:"700", cursor:"pointer", fontFamily:F, transition:"background .3s" }}>
-                  <Save size={15}/>{infoSaved ? "保存しました ✓" : "保存する"}
+                <Field label="会社名">
+                  <input type="text" value={tempCompany} onChange={e => setTempCompany(e.target.value)} style={inputStyle()}/>
+                </Field>
+                <Field label="展示会名">
+                  <input type="text" value={tempEvent} onChange={e => setTempEvent(e.target.value)} style={inputStyle({ marginBottom:"1.25rem" })}/>
+                </Field>
+                <button onClick={handleSaveEventInfo} disabled={saving}
+                  style={{ display:"flex", alignItems:"center", gap:"7px", padding:"10px 20px", border:"none", borderRadius:"8px", background: infoSaved ? "#10b981" : "#0ea5e9", color:"#fff", fontSize:"14px", fontWeight:"700", cursor: saving ? "wait" : "pointer", fontFamily:F, transition:"background .3s" }}>
+                  {saving ? <Loader size={15} style={{ animation:"spin 1s linear infinite" }}/> : <Save size={15}/>}
+                  {infoSaved ? "保存しました ✓" : saving ? "保存中..." : "保存する"}
                 </button>
               </div>
             </section>
@@ -435,76 +521,53 @@ export default function DigitalCatalogSystem() {
                 </div>
               </SectionTitle>
 
-              {/* ── 追加フォーム ── */}
               {showAddForm && (
                 <div style={{ background:"#f0f9ff", border:"1.5px solid #7dd3fc", borderRadius:"12px", padding:"1.25rem", marginBottom:"1rem" }}>
                   <p style={{ margin:"0 0 1rem", fontWeight:"700", fontSize:"14px", color:"#0369a1" }}>新しいカタログを追加</p>
                   {formError && <p style={{ color:"#dc2626", fontSize:"13px", margin:"0 0 10px", display:"flex", alignItems:"center", gap:"5px" }}><X size={13}/>{formError}</p>}
-
                   <div style={{ display:"grid", gap:"12px" }}>
-
-                    {/* タイトル */}
                     <div>
                       <label style={{ fontSize:"12px", fontWeight:"600", color:"#0369a1", display:"block", marginBottom:"4px" }}>タイトル <span style={{ color:"#dc2626" }}>*</span></label>
-                      <input type="text" placeholder="例：製品カタログ 2025年春版" value={newCatalog.title}
-                        onChange={e => setNewCatalog(p => ({ ...p, title: e.target.value }))}
-                        style={inputStyle({ border:"1px solid #7dd3fc", background:"#fff" })}/>
+                      <input type="text" placeholder="例：製品カタログ 2025年春版" value={newCatalog.title} onChange={e => setNewCatalog(p => ({ ...p, title: e.target.value }))} style={inputStyle({ border:"1px solid #7dd3fc", background:"#fff" })}/>
                     </div>
-
-                    {/* ファイルサイズ */}
                     <div>
                       <label style={{ fontSize:"12px", fontWeight:"600", color:"#0369a1", display:"block", marginBottom:"4px" }}>ファイルサイズ（任意）</label>
-                      <input type="text" placeholder="例：5.3 MB" value={newCatalog.fileSize}
-                        onChange={e => setNewCatalog(p => ({ ...p, fileSize: e.target.value }))}
-                        style={inputStyle({ border:"1px solid #7dd3fc", background:"#fff" })}/>
+                      <input type="text" placeholder="例：5.3 MB" value={newCatalog.fileSize} onChange={e => setNewCatalog(p => ({ ...p, fileSize: e.target.value }))} style={inputStyle({ border:"1px solid #7dd3fc", background:"#fff" })}/>
                     </div>
-
-                    {/* 説明文 */}
                     <div>
                       <label style={{ fontSize:"12px", fontWeight:"600", color:"#0369a1", display:"block", marginBottom:"4px" }}>説明文</label>
-                      <textarea rows={2} placeholder="カタログの内容を簡単に説明してください" value={newCatalog.description}
-                        onChange={e => setNewCatalog(p => ({ ...p, description: e.target.value }))}
-                        style={{ ...inputStyle({ border:"1px solid #7dd3fc", background:"#fff" }), resize:"vertical" }}/>
+                      <textarea rows={2} placeholder="カタログの内容を簡単に説明してください" value={newCatalog.description} onChange={e => setNewCatalog(p => ({ ...p, description: e.target.value }))} style={{ ...inputStyle({ border:"1px solid #7dd3fc", background:"#fff" }), resize:"vertical" }}/>
                     </div>
-
-                    {/* Google Drive URL */}
                     <div>
-                      <label style={{ fontSize:"12px", fontWeight:"600", color:"#0369a1", display:"block", marginBottom:"4px" }}>
-                        Google Drive 共有URL <span style={{ color:"#dc2626" }}>*</span>
-                      </label>
+                      <label style={{ fontSize:"12px", fontWeight:"600", color:"#0369a1", display:"block", marginBottom:"4px" }}>Google Drive 共有URL <span style={{ color:"#dc2626" }}>*</span></label>
                       <div style={{ position:"relative" }}>
-                        <input type="text"
-                          placeholder="https://drive.google.com/file/d/〇〇〇/view?usp=sharing"
-                          value={newCatalog.driveUrl}
+                        <input type="text" placeholder="https://drive.google.com/file/d/〇〇〇/view?usp=sharing" value={newCatalog.driveUrl}
                           onChange={e => handleDriveUrlChange(e.target.value)}
                           style={{ ...inputStyle({ border:`1.5px solid ${urlValid === true ? "#16a34a" : urlValid === false ? "#ef4444" : "#7dd3fc"}`, background:"#fff", paddingRight:"36px" }) }}/>
-                        {urlValid === true && <span style={{ position:"absolute", right:"10px", top:"50%", transform:"translateY(-50%)", color:"#16a34a", fontSize:"18px" }}>✓</span>}
-                        {urlValid === false && <span style={{ position:"absolute", right:"10px", top:"50%", transform:"translateY(-50%)", color:"#ef4444", fontSize:"18px" }}>✗</span>}
+                        {urlValid === true  && <span style={{ position:"absolute", right:"10px", top:"50%", transform:"translateY(-50%)", color:"#16a34a" }}>✓</span>}
+                        {urlValid === false && <span style={{ position:"absolute", right:"10px", top:"50%", transform:"translateY(-50%)", color:"#ef4444" }}>✗</span>}
                       </div>
-
-                      {/* 手順ガイド */}
                       <div style={{ marginTop:"10px", background:"#fff", border:"1px solid #bae6fd", borderRadius:"8px", padding:"12px 14px" }}>
                         <p style={{ margin:"0 0 8px", fontSize:"12px", fontWeight:"700", color:"#0369a1", display:"flex", alignItems:"center", gap:"5px" }}>
                           <LinkIcon size={13}/>Google DriveのURLの取得方法
                         </p>
                         <ol style={{ margin:0, paddingLeft:"18px", fontSize:"12px", color:"var(--color-text-secondary)", lineHeight:2 }}>
                           <li><a href="https://drive.google.com" target="_blank" rel="noreferrer" style={{ color:"#0ea5e9" }}>drive.google.com</a> を開いてPDFをアップロード</li>
-                          <li>アップロードしたPDFを<strong>右クリック</strong> →「共有」をクリック</li>
+                          <li>PDFを<strong>右クリック</strong> →「共有」をクリック</li>
                           <li>「リンクを知っている全員」に変更して「<strong>リンクをコピー</strong>」</li>
                           <li>コピーしたURLをこの欄に貼り付ける</li>
                         </ol>
                       </div>
                     </div>
                   </div>
-
-                  <button onClick={handleAddCatalog}
-                    style={{ marginTop:"14px", display:"flex", alignItems:"center", gap:"6px", padding:"10px 20px", border:"none", borderRadius:"8px", background:"#0ea5e9", color:"#fff", fontSize:"13px", fontWeight:"700", cursor:"pointer", fontFamily:F }}>
-                    <Plus size={14}/>追加する
+                  <button onClick={handleAddCatalog} disabled={saving}
+                    style={{ marginTop:"14px", display:"flex", alignItems:"center", gap:"6px", padding:"10px 20px", border:"none", borderRadius:"8px", background: saving ? "#94a3b8" : "#0ea5e9", color:"#fff", fontSize:"13px", fontWeight:"700", cursor: saving ? "wait" : "pointer", fontFamily:F }}>
+                    {saving ? <Loader size={14} style={{ animation:"spin 1s linear infinite" }}/> : <Plus size={14}/>}
+                    {saving ? "追加中..." : "追加する"}
                   </button>
                 </div>
               )}
 
-              {/* カタログ一覧 */}
               <div style={{ display:"flex", flexDirection:"column", gap:"8px" }}>
                 {catalogs.map(catalog => (
                   <div key={catalog.id} style={{ background:"var(--color-background-primary)", border:"0.5px solid var(--color-border-tertiary)", borderRadius:"10px", padding:"1rem 1.25rem", display:"flex", alignItems:"flex-start", gap:"12px" }}>
@@ -515,16 +578,14 @@ export default function DigitalCatalogSystem() {
                       <p style={{ margin:"0 0 3px", fontWeight:"700", fontSize:"14px" }}>{catalog.title}</p>
                       <p style={{ margin:"0 0 4px", fontSize:"12px", color:"var(--color-text-secondary)", lineHeight:1.5 }}>{catalog.description || "説明なし"}</p>
                       <div style={{ display:"flex", alignItems:"center", gap:"8px", flexWrap:"wrap" }}>
-                        <span style={{ fontSize:"12px", color:"#0ea5e9", fontWeight:"600" }}>PDF · {catalog.fileSize}</span>
-                        {catalog.downloadUrl
-                          ? <span style={{ fontSize:"11px", color:"#16a34a", fontWeight:"600", background:"#dcfce7", padding:"1px 7px", borderRadius:"20px", display:"flex", alignItems:"center", gap:"3px" }}>
-                              <ExternalLink size={10}/>Drive連携済み
-                            </span>
+                        <span style={{ fontSize:"12px", color:"#0ea5e9", fontWeight:"600" }}>PDF · {catalog.file_size}</span>
+                        {catalog.download_url
+                          ? <span style={{ fontSize:"11px", color:"#16a34a", fontWeight:"600", background:"#dcfce7", padding:"1px 7px", borderRadius:"20px", display:"flex", alignItems:"center", gap:"3px" }}><ExternalLink size={10}/>Drive連携済み</span>
                           : <span style={{ fontSize:"11px", color:"#d97706", fontWeight:"600", background:"#fef3c7", padding:"1px 7px", borderRadius:"20px" }}>URL未設定</span>
                         }
                       </div>
                     </div>
-                    <button onClick={() => { if (window.confirm(`「${catalog.title}」を削除しますか？`)) handleDelete(catalog.id); }}
+                    <button onClick={() => handleDelete(catalog.id, catalog.title)}
                       style={{ flexShrink:0, display:"flex", alignItems:"center", gap:"5px", padding:"7px 10px", border:"1px solid #fca5a5", borderRadius:"7px", background:"#fff", color:"#dc2626", fontSize:"12px", fontWeight:"600", cursor:"pointer", fontFamily:F }}>
                       <Trash2 size={13}/>削除
                     </button>
@@ -559,7 +620,7 @@ function MetricCard({ label, value, color, bg, icon, primary }) {
       {primary && <div style={{ position:"absolute", top:0, left:0, right:0, height:"3px", background:"linear-gradient(90deg,#0ea5e9,#06b6d4)" }}/>}
       <div style={{ width:"36px", height:"36px", borderRadius:"10px", background:bg, display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 10px" }}>{icon}</div>
       <p style={{ margin:"0 0 4px", fontSize:"11px", fontWeight:"600", color:"var(--color-text-secondary)", letterSpacing:".05em" }}>{label}</p>
-      <p style={{ margin:0, fontSize:"36px", fontWeight:"700", color, lineHeight:1, animation:"countUp .4s ease" }}>{value.toLocaleString()}</p>
+      <p style={{ margin:0, fontSize:"36px", fontWeight:"700", color, lineHeight:1 }}>{value.toLocaleString()}</p>
       <p style={{ margin:"4px 0 0", fontSize:"11px", color:"var(--color-text-secondary)" }}>件</p>
     </div>
   );
